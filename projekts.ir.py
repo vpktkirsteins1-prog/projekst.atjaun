@@ -33,7 +33,7 @@ def ensure_files():
 ensure_files()
 
 
-# Galvenā aplikācijas klase
+# Galvenā aplikācijas klase (objekt)
 class BudgetApp:
     def __init__(self, root):
         # Saglabā galveno logu
@@ -432,5 +432,5 @@ class BudgetApp:
 # Programmas starts
 if __name__ == "__main__":
     root = tk.Tk()          # Izveido galveno logu
-    app = BudgetApp(root)   # Izveido aplikācijas objektu
+    app = BudgetApp(root)   # Izveido aplikācijas objektu (objekt)
     root.mainloop()         # Palaiž programmas galveno ciklu
