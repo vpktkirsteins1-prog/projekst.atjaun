@@ -2,12 +2,30 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import sqlite3
 import hashlib
+import json
+import urllib.request
 
 DB_FILE = "budzets.db"
 
 
 def hash_password(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def get_exchange_rate(base_currency="EUR", target_currency="USD"):
+    url = f"https://open.er-api.com/v6/latest/{base_currency}"
+
+    with urllib.request.urlopen(url, timeout=10) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    if data.get("result") != "success":
+        raise Exception("API neatgrieza veiksmīgu atbildi.")
+
+    rates = data.get("rates", {})
+    if target_currency not in rates:
+        raise Exception(f"Nav atrasts kurss valūtai: {target_currency}")
+
+    return rates[target_currency]
 
 
 def ensure_database():
@@ -43,7 +61,7 @@ class BudgetApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Personīgā budžeta aplikācija")
-        self.root.geometry("900x550")
+        self.root.geometry("950x620")
         self.root.configure(bg="#f4f6f8")
 
         self.current_user = None
@@ -53,6 +71,8 @@ class BudgetApp:
         self.entry_amount = None
         self.entry_description = None
         self.type_var = None
+        self.currency_var = None
+        self.converted_balance_label = None
 
         self.style = ttk.Style()
         self.style.theme_use("clam")
@@ -252,6 +272,36 @@ class BudgetApp:
         )
         self.balance_label.pack(side="right")
 
+        currency_frame = tk.Frame(app_frame, bg="#f4f6f8")
+        currency_frame.pack(fill="x", pady=(8, 0))
+
+        tk.Label(currency_frame, text="Valūta:", bg="#f4f6f8", font=("Arial", 11)).pack(side="left")
+
+        self.currency_var = tk.StringVar(value="USD")
+
+        ttk.Combobox(
+            currency_frame,
+            textvariable=self.currency_var,
+            values=["USD", "GBP", "CHF", "JPY"],
+            state="readonly",
+            width=10
+        ).pack(side="left", padx=8)
+
+        ttk.Button(
+            currency_frame,
+            text="Konvertēt bilanci",
+            command=self.convert_balance
+        ).pack(side="left", padx=8)
+
+        self.converted_balance_label = tk.Label(
+            currency_frame,
+            text="Bilance citā valūtā: -",
+            font=("Arial", 11),
+            bg="#f4f6f8",
+            fg="#111827"
+        )
+        self.converted_balance_label.pack(side="left", padx=12)
+
         self.status_label = tk.Label(
             app_frame,
             text="",
@@ -334,6 +384,38 @@ class BudgetApp:
 
         balance = income - expense
         self.balance_label.config(text=f"Bilance: {balance:.2f} €")
+
+    def convert_balance(self):
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM records WHERE username = ? AND type = 'Ienākums'",
+                (self.current_user,)
+            )
+            income = cursor.fetchone()[0]
+
+            cursor.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM records WHERE username = ? AND type = 'Izdevums'",
+                (self.current_user,)
+            )
+            expense = cursor.fetchone()[0]
+
+            conn.close()
+
+            balance_eur = income - expense
+            target_currency = self.currency_var.get()
+
+            rate = get_exchange_rate("EUR", target_currency)
+            converted_balance = balance_eur * rate
+
+            self.converted_balance_label.config(
+                text=f"Bilance {target_currency}: {converted_balance:.2f}"
+            )
+            self.status_label.config(text="Bilance veiksmīgi konvertēta.")
+        except Exception as e:
+            self.status_label.config(text=f"Neizdevās iegūt valūtas kursu no API. {e}")
 
     def delete_selected(self):
         selected = self.table.selection()
