@@ -4,6 +4,7 @@ import sqlite3
 import hashlib
 import json
 import urllib.request
+import re
 
 DB_FILE = "budzets.db"
 
@@ -153,8 +154,16 @@ class BudgetApp:
             messagebox.showerror("Kļūda", "Aizpildi lietotājvārdu un paroli.")
             return
 
-        if len(password) < 4:
-            messagebox.showerror("Kļūda", "Parolei jābūt vismaz 4 simbolus garai.")
+        if len(password) < 8:
+              messagebox.showerror("Kļūda", "Parolei jābūt vismaz 8 simbolus garai.")
+              return
+
+        if not re.search(r"\d", password):
+           messagebox.showerror("Kļūda", "Parolei jāsatur vismaz 1 cipars.")
+           return
+
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+            messagebox.showerror("Kļūda", "Parolei jāsatur vismaz 1 speciālais simbols.")
             return
 
         if self.user_exists(username):
