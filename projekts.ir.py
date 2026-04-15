@@ -9,6 +9,12 @@ import re
 DB_FILE = "budzets.db"
 
 
+def get_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
 def hash_password(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
@@ -30,26 +36,60 @@ def get_exchange_rate(base_currency="EUR", target_currency="USD"):
 
 
 def ensure_database():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS user (
+            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
+            password_hash TEXT NOT NULL,
+            blocked BOOLEAN NOT NULL DEFAULT 0,
+            active_from DATE NOT NULL DEFAULT (date('now')),
+            active_until DATE
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_code TEXT NOT NULL,
+            unique_code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            category_id INTEGER,
             type TEXT NOT NULL,
             amount REAL NOT NULL,
-            description TEXT
+            description TEXT,
+            FOREIGN KEY (user_id) REFERENCES user(user_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE,
+            FOREIGN KEY (category_id) REFERENCES categories(id)
+                ON DELETE SET NULL
+                ON UPDATE CASCADE
         )
     """)
+
+    cursor.execute("SELECT COUNT(*) FROM categories")
+    if cursor.fetchone()[0] == 0:
+        default_categories = [
+            ("EXPENSE", "FOOD", "Pārtika"),
+            ("EXPENSE", "TRANSPORT", "Transports"),
+            ("EXPENSE", "ENTERTAINMENT", "Izklaide"),
+            ("EXPENSE", "OTHER_EXPENSE", "Citi izdevumi"),
+            ("INCOME", "SALARY", "Alga"),
+            ("INCOME", "OTHER_INCOME", "Citi ienākumi")
+        ]
+        cursor.executemany("""
+            INSERT INTO categories (group_code, unique_code, name)
+            VALUES (?, ?, ?)
+        """, default_categories)
 
     conn.commit()
     conn.close()
@@ -62,10 +102,12 @@ class BudgetApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Personīgā budžeta aplikācija")
-        self.root.geometry("950x620")
+        self.root.geometry("1120x680")
         self.root.configure(bg="#f4f6f8")
 
-        self.current_user = None
+        self.current_user_id = None
+        self.current_username = None
+
         self.table = None
         self.balance_label = None
         self.status_label = None
@@ -74,6 +116,8 @@ class BudgetApp:
         self.type_var = None
         self.currency_var = None
         self.converted_balance_label = None
+        self.category_var = None
+        self.category_combo = None
 
         self.style = ttk.Style()
         self.style.theme_use("clam")
@@ -125,9 +169,9 @@ class BudgetApp:
         )
 
     def user_exists(self, username):
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+        cursor.execute("SELECT 1 FROM user WHERE username = ?", (username,))
         result = cursor.fetchone()
         conn.close()
         return result is not None
@@ -135,16 +179,20 @@ class BudgetApp:
     def validate_user(self, username, password):
         password_hash = hash_password(password)
 
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT 1 FROM users WHERE username = ? AND password_hash = ?",
-            (username, password_hash)
-        )
+        cursor.execute("""
+            SELECT user_id, username
+            FROM user
+            WHERE username = ?
+              AND password_hash = ?
+              AND blocked = 0
+              AND date('now') >= active_from
+              AND (active_until IS NULL OR date('now') <= active_until)
+        """, (username, password_hash))
         result = cursor.fetchone()
         conn.close()
-
-        return result is not None
+        return result
 
     def register(self):
         username = self.login_username_entry.get().strip()
@@ -155,12 +203,12 @@ class BudgetApp:
             return
 
         if len(password) < 8:
-              messagebox.showerror("Kļūda", "Parolei jābūt vismaz 8 simbolus garai.")
-              return
+            messagebox.showerror("Kļūda", "Parolei jābūt vismaz 8 simbolus garai.")
+            return
 
         if not re.search(r"\d", password):
-           messagebox.showerror("Kļūda", "Parolei jāsatur vismaz 1 cipars.")
-           return
+            messagebox.showerror("Kļūda", "Parolei jāsatur vismaz 1 cipars.")
+            return
 
         if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
             messagebox.showerror("Kļūda", "Parolei jāsatur vismaz 1 speciālais simbols.")
@@ -172,12 +220,12 @@ class BudgetApp:
 
         password_hash = hash_password(password)
 
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-            (username, password_hash)
-        )
+        cursor.execute("""
+            INSERT INTO user (username, password_hash, blocked, active_from, active_until)
+            VALUES (?, ?, 0, date('now'), NULL)
+        """, (username, password_hash))
         conn.commit()
         conn.close()
 
@@ -189,15 +237,32 @@ class BudgetApp:
         username = self.login_username_entry.get().strip()
         password = self.login_password_entry.get().strip()
 
-        if self.validate_user(username, password):
-            self.current_user = username
+        result = self.validate_user(username, password)
+        if result:
+            self.current_user_id = result[0]
+            self.current_username = result[1]
             self.show_main_app()
         else:
-            messagebox.showerror("Kļūda", "Nepareizs lietotājvārds vai parole.")
+            messagebox.showerror(
+                "Kļūda",
+                "Nepareizs lietotājvārds vai parole, vai lietotājs nav aktīvs."
+            )
 
     def logout(self):
-        self.current_user = None
+        self.current_user_id = None
+        self.current_username = None
         self.show_login_screen()
+
+    def load_categories(self):
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM categories ORDER BY name")
+        categories = [row[0] for row in cursor.fetchall()]
+        conn.close()
+
+        self.category_combo["values"] = categories
+        if categories:
+            self.category_var.set(categories[0])
 
     def show_main_app(self):
         self.clear_root()
@@ -210,7 +275,7 @@ class BudgetApp:
 
         tk.Label(
             top_bar,
-            text=f"Personīgā budžeta pārvaldība — {self.current_user}",
+            text=f"Personīgā budžeta pārvaldība — {self.current_username}",
             font=("Arial", 20, "bold"),
             bg="#f4f6f8",
             fg="#1f2937"
@@ -222,6 +287,7 @@ class BudgetApp:
         input_card.pack(fill="x", pady=(0, 15))
 
         self.type_var = tk.StringVar(value="Izdevums")
+        self.category_var = tk.StringVar()
 
         tk.Label(input_card, text="Tips", bg="white", font=("Arial", 11)).grid(row=0, column=0, padx=8, pady=8)
         ttk.Combobox(
@@ -232,30 +298,42 @@ class BudgetApp:
             width=15
         ).grid(row=0, column=1, padx=8, pady=8)
 
-        tk.Label(input_card, text="Summa", bg="white", font=("Arial", 11)).grid(row=0, column=2, padx=8, pady=8)
+        tk.Label(input_card, text="Kategorija", bg="white", font=("Arial", 11)).grid(row=0, column=2, padx=8, pady=8)
+        self.category_combo = ttk.Combobox(
+            input_card,
+            textvariable=self.category_var,
+            state="readonly",
+            width=18
+        )
+        self.category_combo.grid(row=0, column=3, padx=8, pady=8)
+        self.load_categories()
+
+        tk.Label(input_card, text="Summa", bg="white", font=("Arial", 11)).grid(row=0, column=4, padx=8, pady=8)
         self.entry_amount = ttk.Entry(input_card, width=18)
-        self.entry_amount.grid(row=0, column=3, padx=8, pady=8)
+        self.entry_amount.grid(row=0, column=5, padx=8, pady=8)
 
-        tk.Label(input_card, text="Apraksts", bg="white", font=("Arial", 11)).grid(row=0, column=4, padx=8, pady=8)
+        tk.Label(input_card, text="Apraksts", bg="white", font=("Arial", 11)).grid(row=0, column=6, padx=8, pady=8)
         self.entry_description = ttk.Entry(input_card, width=25)
-        self.entry_description.grid(row=0, column=5, padx=8, pady=8)
+        self.entry_description.grid(row=0, column=7, padx=8, pady=8)
 
-        ttk.Button(input_card, text="Pievienot", command=self.add_record).grid(row=0, column=6, padx=12, pady=8)
+        ttk.Button(input_card, text="Pievienot", command=self.add_record).grid(row=0, column=8, padx=12, pady=8)
 
         table_card = tk.Frame(app_frame, bg="white", bd=1, relief="solid", padx=10, pady=10)
         table_card.pack(fill="both", expand=True)
 
-        columns = ("ID", "Tips", "Summa", "Apraksts")
+        columns = ("ID", "Tips", "Kategorija", "Summa", "Apraksts")
         self.table = ttk.Treeview(table_card, columns=columns, show="headings")
         self.table.heading("ID", text="ID")
         self.table.heading("Tips", text="Tips")
+        self.table.heading("Kategorija", text="Kategorija")
         self.table.heading("Summa", text="Summa (€)")
         self.table.heading("Apraksts", text="Apraksts")
 
         self.table.column("ID", width=70, anchor="center")
-        self.table.column("Tips", width=140, anchor="center")
+        self.table.column("Tips", width=120, anchor="center")
+        self.table.column("Kategorija", width=160, anchor="center")
         self.table.column("Summa", width=140, anchor="center")
-        self.table.column("Apraksts", width=350, anchor="w")
+        self.table.column("Apraksts", width=320, anchor="w")
 
         scrollbar = ttk.Scrollbar(table_card, orient="vertical", command=self.table.yview)
         self.table.configure(yscrollcommand=scrollbar.set)
@@ -325,6 +403,7 @@ class BudgetApp:
 
     def add_record(self):
         record_type = self.type_var.get()
+        category_name = self.category_var.get()
         amount_text = self.entry_amount.get().strip()
         description = self.entry_description.get().strip()
 
@@ -342,12 +421,18 @@ class BudgetApp:
             self.status_label.config(text="Summai jābūt lielākai par 0.")
             return
 
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO records (username, type, amount, description) VALUES (?, ?, ?, ?)",
-            (self.current_user, record_type, amount, description)
-        )
+
+        cursor.execute("SELECT id FROM categories WHERE name = ?", (category_name,))
+        category_row = cursor.fetchone()
+        category_id = category_row[0] if category_row else None
+
+        cursor.execute("""
+            INSERT INTO records (user_id, category_id, type, amount, description)
+            VALUES (?, ?, ?, ?, ?)
+        """, (self.current_user_id, category_id, record_type, amount, description))
+
         conn.commit()
         conn.close()
 
@@ -361,12 +446,14 @@ class BudgetApp:
         for row in self.table.get_children():
             self.table.delete(row)
 
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, type, amount, description FROM records WHERE username = ?",
-            (self.current_user,)
-        )
+        cursor.execute("""
+            SELECT records.id, records.type, categories.name, records.amount, records.description
+            FROM records
+            LEFT JOIN categories ON records.category_id = categories.id
+            WHERE records.user_id = ?
+        """, (self.current_user_id,))
         rows = cursor.fetchall()
         conn.close()
 
@@ -374,19 +461,21 @@ class BudgetApp:
             self.table.insert("", tk.END, values=row)
 
     def calculate_balance(self):
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_connection()
         cursor = conn.cursor()
 
-        cursor.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM records WHERE username = ? AND type = 'Ienākums'",
-            (self.current_user,)
-        )
+        cursor.execute("""
+            SELECT COALESCE(SUM(amount), 0)
+            FROM records
+            WHERE user_id = ? AND type = 'Ienākums'
+        """, (self.current_user_id,))
         income = cursor.fetchone()[0]
 
-        cursor.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM records WHERE username = ? AND type = 'Izdevums'",
-            (self.current_user,)
-        )
+        cursor.execute("""
+            SELECT COALESCE(SUM(amount), 0)
+            FROM records
+            WHERE user_id = ? AND type = 'Izdevums'
+        """, (self.current_user_id,))
         expense = cursor.fetchone()[0]
 
         conn.close()
@@ -396,19 +485,21 @@ class BudgetApp:
 
     def convert_balance(self):
         try:
-            conn = sqlite3.connect(DB_FILE)
+            conn = get_connection()
             cursor = conn.cursor()
 
-            cursor.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM records WHERE username = ? AND type = 'Ienākums'",
-                (self.current_user,)
-            )
+            cursor.execute("""
+                SELECT COALESCE(SUM(amount), 0)
+                FROM records
+                WHERE user_id = ? AND type = 'Ienākums'
+            """, (self.current_user_id,))
             income = cursor.fetchone()[0]
 
-            cursor.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM records WHERE username = ? AND type = 'Izdevums'",
-                (self.current_user,)
-            )
+            cursor.execute("""
+                SELECT COALESCE(SUM(amount), 0)
+                FROM records
+                WHERE user_id = ? AND type = 'Izdevums'
+            """, (self.current_user_id,))
             expense = cursor.fetchone()[0]
 
             conn.close()
@@ -436,12 +527,12 @@ class BudgetApp:
         values = self.table.item(selected[0])["values"]
         record_id = values[0]
 
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "DELETE FROM records WHERE id = ? AND username = ?",
-            (record_id, self.current_user)
-        )
+        cursor.execute("""
+            DELETE FROM records
+            WHERE id = ? AND user_id = ?
+        """, (record_id, self.current_user_id))
         conn.commit()
         conn.close()
 
@@ -450,16 +541,19 @@ class BudgetApp:
         self.calculate_balance()
 
     def delete_all(self):
-        confirm = messagebox.askyesno("Apstiprinājums", "Vai tiešām dzēst visus šī lietotāja ierakstus?")
+        confirm = messagebox.askyesno(
+            "Apstiprinājums",
+            "Vai tiešām dzēst visus šī lietotāja ierakstus?"
+        )
         if not confirm:
             return
 
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "DELETE FROM records WHERE username = ?",
-            (self.current_user,)
-        )
+        cursor.execute("""
+            DELETE FROM records
+            WHERE user_id = ?
+        """, (self.current_user_id,))
         conn.commit()
         conn.close()
 
